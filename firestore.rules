@@ -1,0 +1,122 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function isSelf(uid) { return signedIn() && request.auth.uid == uid; }
+    function isParticipant(data) { return signedIn() && request.auth.uid in data.participantIds; }
+    function requestExists(collectionName, requestId) {
+      return exists(/databases/$(database)/documents/$(collectionName)/$(requestId));
+    }
+    function requestData(collectionName, requestId) {
+      return get(/databases/$(database)/documents/$(collectionName)/$(requestId)).data;
+    }
+
+    match /users/{uid} {
+      allow create: if isSelf(uid)
+        && request.resource.data.keys().hasAll(['uid','fullName','email','role','accountStatus','profileImage','createdAt','updatedAt'])
+        && request.resource.data.keys().hasOnly(['uid','fullName','email','role','accountStatus','profileImage','createdAt','updatedAt'])
+        && request.resource.data.uid == uid
+        && request.resource.data.role in ['student','mentor']
+        && request.resource.data.accountStatus == (request.resource.data.role == 'mentor' ? 'pending_approval' : 'active')
+        && request.resource.data.createdAt == request.time && request.resource.data.updatedAt == request.time;
+      allow get: if isSelf(uid);
+      allow list, update, delete: if false;
+    }
+
+    match /studentProfiles/{uid} {
+      allow create: if isSelf(uid) && get(/databases/$(database)/documents/users/$(uid)).data.role == 'student' && request.resource.data.uid == uid;
+      allow get: if isSelf(uid);
+      allow list, update, delete: if false;
+    }
+    match /mentorProfiles/{uid} {
+      allow create: if isSelf(uid) && get(/databases/$(database)/documents/users/$(uid)).data.role == 'mentor' && request.resource.data.uid == uid;
+      allow get: if isSelf(uid);
+      allow list, update, delete: if false;
+    }
+
+    // Peer study invitations: only the sender creates; only the recipient responds.
+    match /studyInvitations/{id} {
+      allow create: if signedIn() && request.resource.data.senderId == request.auth.uid
+        && request.resource.data.receiverId is string && request.resource.data.receiverId != request.auth.uid
+        && request.resource.data.topic is string && request.resource.data.status == 'pending';
+      allow get, list: if signedIn() && (resource.data.senderId == request.auth.uid || resource.data.receiverId == request.auth.uid);
+      allow update: if signedIn() && resource.data.receiverId == request.auth.uid
+        && resource.data.status == 'pending' && request.resource.data.status in ['accepted','declined']
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status','updatedAt']);
+      allow delete: if false;
+    }
+
+    // Public, minimal mentor directory. Do not store private email addresses here.
+    // This lets students resolve a mentor's public name to that mentor's Auth UID.
+    match /mentorDirectory/{uid} {
+      allow create: if isSelf(uid)
+        && request.resource.data.uid == uid
+        && request.resource.data.role == 'mentor'
+        && request.resource.data.fullName is string
+        && request.resource.data.fullName.size() >= 2;
+      allow get, list: if true;
+      allow update: if isSelf(uid)
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['fullName', 'accountStatus', 'updatedAt']);
+      allow delete: if false;
+    }
+
+    // Mentor requests follow the same sender/recipient pattern.
+    match /mentorRequests/{id} {
+      allow create: if signedIn() && request.resource.data.senderId == request.auth.uid
+        && request.resource.data.receiverId is string && request.resource.data.receiverId != request.auth.uid
+        && exists(/databases/$(database)/documents/mentorDirectory/$(request.resource.data.receiverId))
+        && get(/databases/$(database)/documents/mentorDirectory/$(request.resource.data.receiverId)).data.role == 'mentor'
+        && request.resource.data.status == 'pending';
+      allow get, list: if signedIn() && (resource.data.senderId == request.auth.uid || resource.data.receiverId == request.auth.uid);
+      allow update: if signedIn() && resource.data.receiverId == request.auth.uid
+        && resource.data.status == 'pending' && request.resource.data.status in ['accepted','declined']
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status','updatedAt']);
+      allow delete: if false;
+    }
+
+    // A notification can only be created for the recipient of a request by its sender.
+    match /notifications/{id} {
+      allow create: if signedIn() && request.resource.data.recipientId is string
+        && request.resource.data.relatedId is string
+        && ((request.resource.data.type == 'invitation'
+          && requestExists('studyInvitations', request.resource.data.relatedId)
+          && requestData('studyInvitations', request.resource.data.relatedId).senderId == request.auth.uid
+          && requestData('studyInvitations', request.resource.data.relatedId).receiverId == request.resource.data.recipientId)
+        || (request.resource.data.type == 'mentor_request'
+          && requestExists('mentorRequests', request.resource.data.relatedId)
+          && requestData('mentorRequests', request.resource.data.relatedId).senderId == request.auth.uid
+          && requestData('mentorRequests', request.resource.data.relatedId).receiverId == request.resource.data.recipientId));
+      allow get, list: if signedIn() && resource.data.recipientId == request.auth.uid;
+      allow update: if signedIn() && resource.data.recipientId == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isRead']);
+      allow delete: if false;
+    }
+
+    // Conversations are limited to their participants; messages inherit that access.
+    match /conversations/{conversationId} {
+      allow create: if signedIn() && request.auth.uid in request.resource.data.participantIds
+        && request.resource.data.participantIds.size() == 2;
+      allow get, list: if isParticipant(resource.data);
+      allow update: if isParticipant(resource.data)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['lastMessage','lastMessageAt']);
+      allow delete: if false;
+      match /messages/{messageId} {
+        function parentConversation() { return get(/databases/$(database)/documents/conversations/$(conversationId)).data; }
+        allow create: if signedIn() && request.auth.uid in parentConversation().participantIds
+          && request.resource.data.senderId == request.auth.uid
+          && request.resource.data.text is string && request.resource.data.text.size() > 0;
+        allow get, list: if signedIn() && request.auth.uid in parentConversation().participantIds;
+        allow update: if signedIn() && request.auth.uid in parentConversation().participantIds
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['readBy']);
+        allow delete: if false;
+      }
+    }
+
+    match /contactMessages/{id} {
+      allow create: if signedIn() && request.resource.data.name is string
+        && request.resource.data.email is string && request.resource.data.message is string;
+      allow read, update, delete: if false;
+    }
+  }
+}
